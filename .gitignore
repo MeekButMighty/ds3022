@@ -245,6 +245,7 @@ __marimo__/
 *.sqlite
 *.sqlite3
 *.wal
+*.csv
 
 # dbt generated files
 03_transform/dbt/target/
