@@ -1,0 +1,36 @@
+#!/bin/bash
+
+set -e
+
+echo "=== Checking for uncommitted changes ==="
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo
+    echo "ERROR: You have uncommitted changes to tracked files."
+    echo "Commit or stash them before syncing with upstream."
+    echo
+    git status
+    exit 1
+fi
+echo
+echo "=== Fetching professor's latest changes ==="
+git fetch upstream
+
+echo
+echo "=== Professor commits not yet in local main ==="
+git log --oneline HEAD..upstream/main
+
+echo
+echo "=== Rebasing onto upstream/main ==="
+git rebase upstream/main
+
+echo
+echo "=== Pushing updated main to your fork ==="
+git push --force-with-lease origin main
+
+echo
+echo "=== Final status ==="
+git status
+
+echo
+echo "=== Ready for class! ==="
