@@ -1,0 +1,67 @@
+#!/bin/bash
+
+set -e
+
+echo "=== Checking repository ==="
+git status
+
+echo
+echo "=== Changes to tracked files ==="
+git diff --stat
+
+echo
+echo "=== Untracked files ==="
+git status --short
+
+echo
+echo "IMPORTANT: Untracked files will NOT be added automatically."
+echo "If you want to commit a new file, use:"
+echo "    git add <filename>"
+echo
+
+# Check whether there is anything to commit
+if git diff --quiet && git diff --cached --quiet; then
+    echo "No changes to tracked files."
+    echo "Nothing to commit."
+    exit 0
+fi
+
+echo
+read -p "Commit message: " message
+
+if [[ -z "$message" ]]; then
+    echo "ERROR: Commit message cannot be empty."
+    exit 1
+fi
+
+echo
+echo "=== Staging modified/deleted tracked files ==="
+git add -u
+
+echo
+echo "=== Files that will be committed ==="
+git status
+
+echo
+read -p "Commit and push these changes? [y/N] " confirm
+
+if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "Cancelled. Nothing was committed."
+    git restore --staged .
+    exit 0
+fi
+
+echo
+echo "=== Committing ==="
+git commit -m "$message"
+
+echo
+echo "=== Pushing to your fork ==="
+git push origin main
+
+echo
+echo "=== Final status ==="
+git status
+
+echo
+echo "=== Work saved to your fork! ==="
