@@ -19,11 +19,13 @@ to cycle through a series of related links to build up all 1000 records.
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 import duckdb
 import httpx
+import pyarrow as pa
 from prefect import flow, task
 from prefect.logging import get_run_logger
 from prefect.task_runners import ThreadPoolTaskRunner
@@ -35,6 +37,13 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 URL = "https://api.github.com/repos/git/git/commits"
 PER_PAGE = 100
 PAGES = 10
+DB_FILE = "actions.duckdb"                               # local duckdb file, created if missing
+LOG_FILE = Path(__file__).parent / "github_ingest.log"   # sits next to this script
+
+# copy everything Prefect logs (including print() from log_prints tasks) into a local file
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+logging.getLogger("prefect").addHandler(file_handler)
 
 
 # ------ only one task ------
@@ -43,8 +52,21 @@ PAGES = 10
 # add more tasks and more data if you like, and do more with it.
 # if successful you should have 1000 records in your db.
 
-# local duckdb file, created if missing
-conn = duckdb.connect("actions.duckdb")  
+def flatten(c):
+    """Pull the fields we care about out of one nested commit object into a flat dict."""
+    gh_author = c.get("author") or {}   # null when the commit email isn't linked to a GitHub account
+    return {
+        "sha": c["sha"],
+        "author_name": c["commit"]["author"]["name"],
+        "author_email": c["commit"]["author"]["email"],
+        "author_login": gh_author.get("login"),
+        "authored_at": c["commit"]["author"]["date"],
+        "committer_name": c["commit"]["committer"]["name"],
+        "committed_at": c["commit"]["committer"]["date"],
+        "message": c["commit"]["message"],
+        "html_url": c["html_url"],
+    }
+
 
 @task(name="ingest", log_prints=True, retries=3, retry_delay_seconds=5)
 def ingest_data():
@@ -67,14 +89,69 @@ def ingest_data():
     # if you need to see a working example of this, see this file in this repo
     # 04_apis/05_pagination.py
 
-    # just a placeholder for now. remove the print below this is built out
-    print("something")
+    logger = get_run_logger()   # like print(), but lets us log at ERROR level
+
+    # follow the "next" link until we've pulled PAGES pages (or run out of pages)
+    url = URL
+    params = {"per_page": PER_PAGE}   # only needed on the first request
+    page = 1
+    all_commits = []
+    try:
+        while url and page <= PAGES:
+            response = httpx.get(url, headers=HEADERS, params=params, timeout=30)
+            response.raise_for_status()   # 4xx/5xx -> exception, instead of parsing an error body as commits
+            commits = response.json()
+            all_commits.extend(flatten(c) for c in commits)   # flatten each commit, add to running list
+            print(f"page {page}: {len(commits)} commits (total {len(all_commits)})")
+
+            url = response.links.get("next", {}).get("url")   # None on the last page
+            params = None                                     # "next" url already has per_page/page
+            page += 1
+    except httpx.HTTPStatusError as e:
+        # GitHub answered with an error, e.g. 401 bad token or 403 rate limited
+        logger.error(f"GitHub returned {e.response.status_code} on page {page}: {e.response.text[:200]}")
+        raise   # re-raise so the task fails and Prefect's retries kick in
+    except httpx.RequestError as e:
+        # never got an answer: timeout, DNS failure, dropped connection
+        logger.error(f"request for page {page} failed: {e!r}")
+        raise
+
+    try:
+        # "with" closes the connection when the block ends, even if an error is raised inside it
+        with duckdb.connect(DB_FILE) as conn:
+            # CREATE OR REPLACE so re-running the flow rebuilds the table instead of duplicating rows
+            conn.execute("""
+                CREATE OR REPLACE TABLE commits (
+                    sha            VARCHAR PRIMARY KEY,
+                    author_name    VARCHAR,
+                    author_email   VARCHAR,
+                    author_login   VARCHAR,
+                    authored_at    TIMESTAMPTZ,
+                    committer_name VARCHAR,
+                    committed_at   TIMESTAMPTZ,
+                    message        VARCHAR,
+                    html_url       VARCHAR
+                )
+            """)
+
+            # build one in-memory arrow table from the list of dicts and insert it in a
+            # single statement (executemany ran one INSERT per row: ~14s vs well under 1s)
+            conn.register("new_rows", pa.Table.from_pylist(all_commits))
+            conn.execute("INSERT INTO commits BY NAME SELECT * FROM new_rows")
+
+            count = conn.execute("SELECT count(*) FROM commits").fetchone()[0]
+    except duckdb.Error as e:
+        # e.g. file locked by another process, duplicate sha, bad timestamp
+        logger.error(f"writing to {DB_FILE} failed: {e}")
+        raise
+
+    print(f"commits table now has {count} rows")
+    return count
 
 
-# name the flow something you can identify as yourself
-@flow(name="nem2p-flow")
+@flow(name="azt6gn-flow")
 def main_flow():
     ingest_data()
 
-# it doesn't seem this flow executes when you run it. Why?
-# fix it ;^)
+if __name__ == "__main__":
+  main_flow()
