@@ -24,7 +24,7 @@ app = Application(
 )
 # Topic settings apply only when the topic is first created; an existing topic keeps its config
 topic = app.topic(
-    name="seismic",
+    name="boomshakalaka",
     value_serializer="json",
     config=TopicConfig(
         num_partitions=3,                         # parallelism: max concurrent consumers in a group
