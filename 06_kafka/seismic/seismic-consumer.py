@@ -24,7 +24,7 @@ app = Application(
     auto_offset_reset="earliest",
     consumer_extra_config={"broker.address.family": "v4"},
 )
-topic = app.topic("seismic", value_deserializer="json")
+topic = app.topic("boomshakalaka", value_deserializer="json")
 
 
 # Write one event to Redis; "update" actions overwrite the earlier "create" for the same unid
