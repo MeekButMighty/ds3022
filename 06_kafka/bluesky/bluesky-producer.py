@@ -17,8 +17,6 @@ last event it saw, using Jetstream's `cursor` parameter (a unix timestamp in mic
 The cursor location is stored in memory. What will happen if the module crashes?
 
 Enable Kafka publishing:
-- Start the Kafka brokers: `docker compose up -d` from `06_kafka/`, and confirm they are up
-    in the Redpanda Console.
 - Uncomment the Kafka setup block below (`KAFKA_BROKER`, `app`, `topic`, `producer`).
     The imports it needs are already at the top of the file.
 - In `on_message`, replace `print(did)` with a produce step: serialize the event with
@@ -57,36 +55,67 @@ Ways to make this more robust once Kafka publishing is enabled:
 JETSTREAM_URL = "wss://jetstream2.us-west.bsky.network/subscribe?wantedCollections=app.bsky.*"
 CURSOR_REWIND_US = 2_000_000               # On reconnect, rewind 2s so no events are missed (may produce a few duplicates)
 MAX_BACKOFF = 60                           # Max seconds to wait between reconnect attempts
+RATE_INTERVAL = 5                          # Seconds between msgs/sec reports
 TOPIC_RETENTION_MS = 3 * 60 * 60 * 1000    # 3 hours
+CURSOR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jetstream_cursor.txt")  # Persisted resume point (gitignored)
 
 cursor = None                              # time_us of the most recent event seen; used to resume after a disconnect
 backoff = 1                                # Current reconnect delay in seconds
 stop = False                               # Set on Ctrl-C to break out of the reconnect loop
+msg_count = 0                              # Messages produced in the current rate window
+window_start = time.time()                 # Start of the current rate window
 
-# KAFKA_BROKER = os.getenv("KAFKA_BROKER", "127.0.0.1:19092,127.0.0.1:29092,127.0.0.1:39092")
-#
-# app = Application(
-#     broker_address=KAFKA_BROKER,
-#     producer_extra_config={
-#         "broker.address.family": "v4",
-#         # Batch settings for better throughput
-#         "linger.ms": 5,  # Wait up to 5ms to batch messages
-#         "batch.size": 100000,  # Batch up to 100KB
-#     }
-# )
-# topic = app.topic(
-#     name="bluesky-events",
-#     value_serializer="json",
-#     config=TopicConfig(
-#         num_partitions=1,
-#         replication_factor=3,
-#         extra_config={"retention.ms": str(TOPIC_RETENTION_MS)}
-#     )
-# )
-#
-# # Create a kafka producer, reused for every message
-# producer = app.get_producer()
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "127.0.0.1:19092,127.0.0.1:29092,127.0.0.1:39092")
 
+app = Application(
+    broker_address=KAFKA_BROKER,
+    producer_extra_config={
+        "broker.address.family": "v4",
+        # Batch settings for better throughput
+        "linger.ms": 5,  # Wait up to 5ms to batch messages
+        "batch.size": 100000,  # Batch up to 100KB
+    }
+)
+topic = app.topic(
+    name="bluesky-events",
+    value_serializer="json",
+    config=TopicConfig(
+        num_partitions=1,
+        replication_factor=3,
+        extra_config={"retention.ms": str(TOPIC_RETENTION_MS)}
+    )
+)
+
+# Create a kafka producer, reused for every message
+producer = app.get_producer()
+
+
+def load_cursor():
+    """Return the saved cursor, or None if missing/unreadable or older than the topic's retention."""
+    try:
+        with open(CURSOR_FILE) as f:
+            saved = int(f.read().strip())
+    except (FileNotFoundError, ValueError) as e:
+        print(f"No usable saved cursor ({type(e).__name__}); starting live")
+        return None
+    # time_us is in microseconds; retention is in milliseconds
+    if saved < (time.time() * 1000 - TOPIC_RETENTION_MS) * 1000:
+        print(f"Saved cursor {saved} is older than topic retention; ignoring and starting live")
+        return None
+    print(f"Loaded saved cursor {saved}")
+    return saved
+
+def save_cursor():
+    """Atomically write the current cursor to disk (temp file + rename, so a crash can't corrupt it)."""
+    if cursor is None:
+        return
+    try:
+        tmp = CURSOR_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(cursor))
+        os.replace(tmp, CURSOR_FILE)
+    except OSError as e:
+        print(f"Failed to save cursor: {e}")
 
 def on_open(ws):
     """Connection established: reset the backoff delay."""
@@ -96,7 +125,7 @@ def on_open(ws):
 
 def on_message(ws, message):
     """Handle each Jetstream event: track cursor, skip non-commit events, key by DID, (optionally) produce to Kafka."""
-    global cursor
+    global cursor, msg_count, window_start
     try:
         data = json.loads(message)
 
@@ -110,7 +139,17 @@ def on_message(ws, message):
         # The DID (decentralized identifier) uniquely identifies the acting user
         did = data["did"]
 
-        print(did)
+        # Serialize (DID key, full event as JSON value) and hand off to the producer's buffer
+        msg = topic.serialize(key=did, value=data)
+        producer.produce(topic=topic.name, key=msg.key, value=msg.value)
+
+        # Throughput: count produced messages and report msgs/sec every RATE_INTERVAL seconds
+        msg_count += 1
+        elapsed = time.time() - window_start
+        if elapsed >= RATE_INTERVAL:
+            print(f"{msg_count / elapsed:,.0f} msgs/sec")
+            msg_count, window_start = 0, time.time()
+            save_cursor()  # Periodic save piggybacks on the rate window
 
     except (json.JSONDecodeError, KeyError) as e:
         print(f"Bad message ({type(e).__name__}: {e})")
@@ -130,6 +169,7 @@ def on_close(ws, close_status_code, close_msg):
 
 # Reconnect loop: each pass opens a connection (resuming from the cursor if we have one)
 # and runs until it drops; then wait with exponential backoff and try again.
+cursor = load_cursor()  # Resume from the last saved position, if valid
 try:
     while not stop:
         url = JETSTREAM_URL + (f"&cursor={cursor - CURSOR_REWIND_US}" if cursor else "")
@@ -152,4 +192,6 @@ except KeyboardInterrupt:
 finally:
     print("\nStopped.")
     # Ensure we flush on exit
-    # producer.flush()
+    producer.flush()
+    save_cursor()  # Save after flushing so buffered messages are sent first
+    print(f"Saved cursor {cursor}")
